@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// A household has exactly two "slots" (personA / personB), mirroring the
+// existing frontend's state.who / owner / paidBy values. The first signup
+// becomes personA; whoever joins via invite code becomes personB.
+enum PersonKey {
+  personA
+  personB
+}
+
+enum Scope {
+  personal
+  shared
+}
+
+model Household {
+  id         String   @id @default(cuid())
+  inviteCode String   @unique @map("invite_code")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  users            User[]
+  profile          HouseholdProfile?
+  expenses         Expense[]
+  recurringCosts   RecurringCost[]
+  merchantMap      MerchantMapEntry[]
+  receiptAssets    ReceiptAsset[]
+  receiptScanUsage ReceiptScanUsage[]
+
+  @@map("households")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  householdId  String    @map("household_id")
+  personKey    PersonKey @map("person_key")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  household    Household          @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  receiptScans ReceiptScanUsage[]
+
+  @@unique([householdId, personKey])
+  @@index([householdId])
+  @@map("users")
+}
+
+// One row per household, holding both people's display settings
+// (personAName/color/income <-> personBName/color/income).
+model HouseholdProfile {
+  householdId   String   @id @map("household_id")
+  personAName   String   @default("Aさん") @map("person_a_name")
+  personBName   String   @default("Bさん") @map("person_b_name")
+  personAColor  String   @default("#184B6C") @map("person_a_color")
+  personBColor  String   @default("#63390F") @map("person_b_color")
+  personAIncome Int      @default(0) @map("person_a_income")
+  personBIncome Int      @default(0) @map("person_b_income")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@map("household_profiles")
+}
+
+model Expense {
+  id             String     @id @default(cuid())
+  householdId    String     @map("household_id")
+  scope          Scope
+  owner          PersonKey?
+  paidBy         PersonKey? @map("paid_by")
+  splitPercentA  Int?       @map("split_percent_a")
+  settled        Boolean    @default(false)
+  settledAt      DateTime?  @map("settled_at")
+  amount         Int
+  category       String
+  memo           String     @default("")
+  date           String
+  receiptAssetId String?    @map("receipt_asset_id")
+  recurringId    String?    @map("recurring_id")
+  recurringMonth String?    @map("recurring_month")
+  createdAt      DateTime   @default(now()) @map("created_at")
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, scope])
+  @@map("expenses")
+}
+
+model RecurringCost {
+  id            String     @id @default(cuid())
+  householdId   String     @map("household_id")
+  scope         Scope
+  owner         PersonKey?
+  paidBy        PersonKey? @map("paid_by")
+  splitPercentA Int?       @map("split_percent_a")
+  name          String
+  amount        Int
+  category      String
+  createdAt     DateTime   @default(now()) @map("created_at")
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, scope])
+  @@map("recurring_costs")
+}
+
+model MerchantMapEntry {
+  householdId String @map("household_id")
+  keyword     String
+  category    String
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@id([householdId, keyword])
+  @@map("merchant_map")
+}
+
+model ReceiptAsset {
+  id          String   @id @default(cuid())
+  householdId String   @map("household_id")
+  imageBytes  Bytes    @map("image_bytes")
+  mimeType    String   @map("mime_type")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId])
+  @@map("receipt_assets")
+}
+
+// One row per receipt-scan API call; used to enforce both the
+// per-household monthly quota and the global (operator-key) daily/monthly cap.
+model ReceiptScanUsage {
+  id          String   @id @default(cuid())
+  householdId String   @map("household_id")
+  userId      String   @map("user_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, createdAt])
+  @@index([createdAt])
+  @@map("receipt_scan_usage")
+}

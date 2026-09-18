@@ -175,11 +175,19 @@
   }
 
   // ---------------- storage facade ----------------
+  // Three possible backends, tried in this order by boot() in app.js:
+  //  1. "artifact"  — running inside a Claude Artifact preview (window.claude.use),
+  //                   unchanged from the original single-file version.
+  //  2. "demo"      — ?demo=1 local design-QA preview, localStorage only, no login.
+  //  3. "backend"   — the real public app: a Node/Express + PostgreSQL server
+  //                   reached over fetch(), with a signed-in household account.
   var dbApi = null;
   var assetsApi = null;
   var sampleApi = null;
   var sampleImageLimits = null;
-  var localMode = false;
+  var localMode = false;     // true for "demo" (kept for the existing localMode banners/checks)
+  var authMode = false;      // true for "backend"
+  var sessionUser = null;    // {id, email, personKey, household:{id, inviteCode}} once signed in
   var LOCAL_KEY = "kakeibo_local_v1";
   var localData = { profile: null, expenses: [], merchantMap: {}, recurring: [] };
   var localListeners = [];
@@ -201,6 +209,88 @@
 
   function uid(){ return "id-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8); }
 
+  // ---- backend (fetch) helpers ----
+  // A 401 here always means "the session cookie is gone" (expired / logged
+  // out elsewhere) — bounce straight back to the auth screen rather than
+  // showing a confusing error state.
+  async function apiFetch(path, opts){
+    opts = opts || {};
+    var headers = Object.assign({}, opts.headers);
+    var body = opts.body;
+    if(body && typeof FormData !== "undefined" && body instanceof FormData){
+      // let the browser set the multipart boundary itself
+    } else if(body !== undefined){
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify(body);
+    }
+    var res;
+    try{
+      res = await fetch(path, { method: opts.method||"GET", headers: headers, body: body, credentials: "same-origin" });
+    }catch(networkErr){
+      var offlineErr = new Error("network_error");
+      offlineErr.code = "network_error";
+      throw offlineErr;
+    }
+    if(res.status === 401 && path !== "/api/auth/me"){
+      sessionUser = null;
+      authMode = true;
+      if(typeof onSessionExpired === "function") onSessionExpired();
+    }
+    if(!res.ok){
+      var payload = {};
+      try{ payload = await res.json(); }catch(e){}
+      var err = new Error(payload.message || ("HTTP "+res.status));
+      err.code = payload.code;
+      err.status = res.status;
+      throw err;
+    }
+    if(res.status === 204) return null;
+    var ct = res.headers.get("content-type") || "";
+    if(ct.indexOf("application/json") > -1) return res.json();
+    return null;
+  }
+  function fileFormData(file){
+    var fd = new FormData();
+    fd.append("image", file);
+    return fd;
+  }
+  function qs(params){
+    var parts = [];
+    for(var k in params){ if(params[k]!==undefined && params[k]!==null) parts.push(encodeURIComponent(k)+"="+encodeURIComponent(params[k])); }
+    return parts.length ? ("?"+parts.join("&")) : "";
+  }
+
+  // Lightweight polling pub/sub: each watchXxx() registers a "tick" function
+  // (a fetch-then-callback) into one of these lists, and Store's mutating
+  // methods (addExpense, etc.) call refreshAll() right after a successful
+  // write so the tab that made the change updates immediately, instead of
+  // waiting for the next interval. The interval itself is what picks up
+  // changes made by the other person's device.
+  var expenseWatchers = [];
+  var recurringWatchers = [];
+  var merchantMapWatchers = [];
+  var profileWatchers = [];
+  function refreshAll(list){ list.forEach(function(tick){ tick(); }); }
+  function pollWatch(list, fetcher, cb, emptyValue, intervalMs){
+    var stopped = false;
+    function tick(){
+      if(stopped) return;
+      fetcher().then(function(data){ if(!stopped) cb(data); }).catch(function(){ if(!stopped) cb(emptyValue); });
+    }
+    tick();
+    var timer = setInterval(tick, intervalMs || 20000);
+    var onFocus = function(){ tick(); };
+    window.addEventListener("focus", onFocus);
+    list.push(tick);
+    return function(){
+      stopped = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+      var i = list.indexOf(tick);
+      if(i>-1) list.splice(i,1);
+    };
+  }
+
   var Store = {
     async getProfile(){
       if(dbApi){
@@ -209,6 +299,7 @@
           return snap.exists ? snap.data() : null;
         }catch(e){ return null; }
       }
+      if(authMode) return apiFetch("/api/profile");
       return localData.profile;
     },
     watchProfile(cb){
@@ -217,23 +308,28 @@
           cb(snap.exists ? snap.data() : null);
         }, function(){ cb(null); });
       }
+      if(authMode){
+        return pollWatch(profileWatchers, function(){ return apiFetch("/api/profile"); }, cb, null, 20000);
+      }
       var fn = function(){ cb(localData.profile); };
       fn();
       localListeners.push(fn);
       return function(){ localListeners = localListeners.filter(function(l){ return l!==fn; }); };
     },
     async setProfile(data){
-      if(dbApi){ await dbApi.doc("settings/profile").set(data); }
-      else { localData.profile = data; saveLocal(); notifyLocal(); }
+      if(dbApi){ await dbApi.doc("settings/profile").set(data); return; }
+      if(authMode){ await apiFetch("/api/profile", { method:"PUT", body:data }); refreshAll(profileWatchers); return; }
+      localData.profile = data; saveLocal(); notifyLocal();
     },
     async updateProfile(patch){
       if(dbApi){
         try{ await dbApi.doc("settings/profile").update(patch); }
         catch(e){ await dbApi.doc("settings/profile").set(patch); }
-      } else {
-        localData.profile = Object.assign({}, localData.profile, patch);
-        saveLocal(); notifyLocal();
+        return;
       }
+      if(authMode){ await apiFetch("/api/profile", { method:"PATCH", body:patch }); refreshAll(profileWatchers); return; }
+      localData.profile = Object.assign({}, localData.profile, patch);
+      saveLocal(); notifyLocal();
     },
     watchExpenses(scope, owner, cb){
       if(dbApi){
@@ -243,6 +339,11 @@
         return q.onSnapshot(function(snap){
           cb(snap.docs.map(function(d){ var o=d.data()||{}; o.id=d.id; return o; }));
         }, function(){ cb([]); });
+      }
+      if(authMode){
+        return pollWatch(expenseWatchers, function(){
+          return apiFetch("/api/expenses"+qs({scope:scope, owner:owner||undefined}));
+        }, cb, [], 15000);
       }
       var fn = function(){
         var list = localData.expenses.filter(function(e){
@@ -256,26 +357,30 @@
       return function(){ localListeners = localListeners.filter(function(l){ return l!==fn; }); };
     },
     async addExpense(data){
-      if(dbApi){ await dbApi.collection("expenses").add(data); }
-      else { data.id = uid(); localData.expenses.push(data); saveLocal(); notifyLocal(); }
+      if(dbApi){ await dbApi.collection("expenses").add(data); return; }
+      if(authMode){ await apiFetch("/api/expenses", { method:"POST", body:data }); refreshAll(expenseWatchers); return; }
+      data.id = uid(); localData.expenses.push(data); saveLocal(); notifyLocal();
     },
     async updateExpense(id, patch){
-      if(dbApi){ await dbApi.doc("expenses/"+id).update(patch); }
-      else {
-        var it = localData.expenses.find(function(e){ return e.id===id; });
-        if(it) Object.assign(it, patch);
-        saveLocal(); notifyLocal();
-      }
+      if(dbApi){ await dbApi.doc("expenses/"+id).update(patch); return; }
+      if(authMode){ await apiFetch("/api/expenses/"+id, { method:"PATCH", body:patch }); refreshAll(expenseWatchers); return; }
+      var it = localData.expenses.find(function(e){ return e.id===id; });
+      if(it) Object.assign(it, patch);
+      saveLocal(); notifyLocal();
     },
     async deleteExpense(id){
-      if(dbApi){ await dbApi.doc("expenses/"+id).delete(); }
-      else { localData.expenses = localData.expenses.filter(function(e){ return e.id!==id; }); saveLocal(); notifyLocal(); }
+      if(dbApi){ await dbApi.doc("expenses/"+id).delete(); return; }
+      if(authMode){ await apiFetch("/api/expenses/"+id, { method:"DELETE" }); refreshAll(expenseWatchers); return; }
+      localData.expenses = localData.expenses.filter(function(e){ return e.id!==id; }); saveLocal(); notifyLocal();
     },
     watchMerchantMap(cb){
       if(dbApi){
         return dbApi.doc("settings/merchantMap").onSnapshot(function(snap){
           cb(snap.exists ? (snap.data()||{}) : {});
         }, function(){ cb({}); });
+      }
+      if(authMode){
+        return pollWatch(merchantMapWatchers, function(){ return apiFetch("/api/merchant-map"); }, cb, {}, 30000);
       }
       var fn = function(){ cb(localData.merchantMap||{}); };
       fn();
@@ -288,11 +393,12 @@
       if(dbApi){
         try{ await dbApi.doc("settings/merchantMap").update(pairs); }
         catch(e){ await dbApi.doc("settings/merchantMap").set(pairs); }
-      } else {
-        Object.assign(localData.merchantMap, pairs);
-        saveLocal();
-        localMapListeners.forEach(function(fn){ fn(); });
+        return;
       }
+      if(authMode){ await apiFetch("/api/merchant-map", { method:"POST", body:{pairs:pairs} }); refreshAll(merchantMapWatchers); return; }
+      Object.assign(localData.merchantMap, pairs);
+      saveLocal();
+      localMapListeners.forEach(function(fn){ fn(); });
     },
     watchRecurring(scope, owner, cb){
       if(dbApi){
@@ -301,6 +407,11 @@
         return q.onSnapshot(function(snap){
           cb(snap.docs.map(function(d){ var o=d.data()||{}; o.id=d.id; return o; }));
         }, function(){ cb([]); });
+      }
+      if(authMode){
+        return pollWatch(recurringWatchers, function(){
+          return apiFetch("/api/recurring"+qs({scope:scope, owner:owner||undefined}));
+        }, cb, [], 20000);
       }
       var fn = function(){
         var list = localData.recurring.filter(function(r){
@@ -313,22 +424,38 @@
       return function(){ localRecurringListeners = localRecurringListeners.filter(function(l){ return l!==fn; }); };
     },
     async addRecurring(data){
-      if(dbApi){ await dbApi.collection("recurring").add(data); }
-      else { data.id = uid(); localData.recurring.push(data); saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); }); }
+      if(dbApi){ await dbApi.collection("recurring").add(data); return; }
+      if(authMode){ await apiFetch("/api/recurring", { method:"POST", body:data }); refreshAll(recurringWatchers); return; }
+      data.id = uid(); localData.recurring.push(data); saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); });
     },
     async updateRecurring(id, patch){
-      if(dbApi){ await dbApi.doc("recurring/"+id).update(patch); }
-      else {
-        var it = localData.recurring.find(function(r){ return r.id===id; });
-        if(it) Object.assign(it, patch);
-        saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); });
-      }
+      if(dbApi){ await dbApi.doc("recurring/"+id).update(patch); return; }
+      if(authMode){ await apiFetch("/api/recurring/"+id, { method:"PATCH", body:patch }); refreshAll(recurringWatchers); return; }
+      var it = localData.recurring.find(function(r){ return r.id===id; });
+      if(it) Object.assign(it, patch);
+      saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); });
     },
     async deleteRecurring(id){
-      if(dbApi){ await dbApi.doc("recurring/"+id).delete(); }
-      else { localData.recurring = localData.recurring.filter(function(r){ return r.id!==id; }); saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); }); }
+      if(dbApi){ await dbApi.doc("recurring/"+id).delete(); return; }
+      if(authMode){ await apiFetch("/api/recurring/"+id, { method:"DELETE" }); refreshAll(recurringWatchers); return; }
+      localData.recurring = localData.recurring.filter(function(r){ return r.id!==id; }); saveLocal(); localRecurringListeners.forEach(function(fn){ fn(); });
     }
   };
+
+  // assetsApi / sampleApi for backend mode: same call shapes as the Artifact
+  // sandbox versions (assetsApi.upload(file) -> {id}; sampleApi.json(prompt,
+  // {images,modelTier}) -> {merchant,date,items} or throws {code}), so
+  // js/screens/receipt.js needs no changes at all.
+  function makeBackendAssetsApi(){
+    return {
+      upload: function(file){ return apiFetch("/api/receipts", { method:"POST", body:fileFormData(file) }); }
+    };
+  }
+  function makeBackendSampleApi(){
+    return {
+      json: function(prompt, opts){ return apiFetch("/api/receipts/scan", { method:"POST", body:fileFormData(opts.images) }); }
+    };
+  }
 
   // ---------------- app state ----------------
   var state = {
@@ -399,4 +526,3 @@
     return arr;
   }
   function pad2(n){ n = String(n); return n.length<2 ? "0"+n : n; }
-

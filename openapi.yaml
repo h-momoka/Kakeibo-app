@@ -1,0 +1,416 @@
+openapi: 3.0.3
+info:
+  title: ふたりの家計簿 API
+  version: "1.0.0"
+  description: |
+    「ふたりの家計簿」の公開Webアプリ版バックエンドAPI。
+    世帯（household）＝二人ひと組の単位で、最初にサインアップした人が personA、
+    招待コードで参加した人が personB になる。認証はCookieセッション方式。
+    レシート解析（POST /api/receipts/scan）のみ、運営者自身のAnthropic APIキーを
+    使用し、二段階のクォータで呼び出し回数を制限する。
+servers:
+  - url: http://localhost:3000
+    description: ローカル開発
+  - url: https://{render-service}.onrender.com
+    description: 本番（Render）
+    variables:
+      render-service:
+        default: kakeibo
+
+security:
+  - cookieAuth: []
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: kakeibo.sid
+  schemas:
+    PersonKey:
+      type: string
+      enum: [personA, personB]
+    Scope:
+      type: string
+      enum: [personal, shared]
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: invalid_input
+        message:
+          type: string
+      required: [code]
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        personKey: { $ref: '#/components/schemas/PersonKey' }
+        household:
+          type: object
+          properties:
+            id: { type: string }
+            inviteCode: { type: string }
+    Profile:
+      type: object
+      nullable: true
+      properties:
+        personAName: { type: string }
+        personBName: { type: string }
+        personAColor: { type: string, example: "#184B6C" }
+        personBColor: { type: string, example: "#63390F" }
+        personAIncome: { type: integer }
+        personBIncome: { type: integer }
+    Expense:
+      type: object
+      properties:
+        id: { type: string }
+        scope: { $ref: '#/components/schemas/Scope' }
+        amount: { type: integer }
+        category: { type: string }
+        memo: { type: string }
+        date: { type: string, format: date, example: "2026-09-01" }
+        createdAt: { type: string, format: date-time }
+        owner: { $ref: '#/components/schemas/PersonKey' }
+        paidBy: { $ref: '#/components/schemas/PersonKey' }
+        splitPercentA: { type: integer, minimum: 0, maximum: 100 }
+        settled: { type: boolean }
+        settledAt: { type: string, format: date-time, nullable: true }
+        receiptAssetId: { type: string, nullable: true }
+        recurringId: { type: string, nullable: true }
+        recurringMonth: { type: string, nullable: true }
+    ExpenseInput:
+      type: object
+      required: [scope, amount, category, date]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        amount: { type: integer }
+        category: { type: string }
+        memo: { type: string }
+        date: { type: string, format: date }
+        owner: { $ref: '#/components/schemas/PersonKey' }
+        paidBy: { $ref: '#/components/schemas/PersonKey' }
+        splitPercentA: { type: integer, minimum: 0, maximum: 100 }
+        settled: { type: boolean }
+        settledAt: { type: string, format: date-time, nullable: true }
+        receiptAssetId: { type: string, nullable: true }
+        recurringId: { type: string, nullable: true }
+        recurringMonth: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    RecurringCost:
+      type: object
+      properties:
+        id: { type: string }
+        scope: { $ref: '#/components/schemas/Scope' }
+        name: { type: string }
+        amount: { type: integer }
+        category: { type: string }
+        createdAt: { type: string, format: date-time }
+        owner: { $ref: '#/components/schemas/PersonKey' }
+        paidBy: { $ref: '#/components/schemas/PersonKey' }
+        splitPercentA: { type: integer }
+    RecurringCostInput:
+      type: object
+      required: [scope, name, amount, category]
+      properties:
+        scope: { $ref: '#/components/schemas/Scope' }
+        name: { type: string }
+        amount: { type: integer }
+        category: { type: string }
+        owner: { $ref: '#/components/schemas/PersonKey' }
+        paidBy: { $ref: '#/components/schemas/PersonKey' }
+        splitPercentA: { type: integer, minimum: 0, maximum: 100 }
+    ReceiptScanResult:
+      type: object
+      properties:
+        merchant: { type: string, nullable: true }
+        date: { type: string, format: date, nullable: true }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              price: { type: integer }
+              category: { type: string }
+
+paths:
+  /api/auth/signup:
+    post:
+      summary: 新規世帯を作成してサインアップ（personAになる）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        '201':
+          description: 作成成功。セッションCookieが発行される。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { description: 入力エラー, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: メールアドレス重複, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/auth/join:
+    post:
+      summary: 招待コードで既存世帯に参加（personBになる）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, inviteCode]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                inviteCode: { type: string }
+      responses:
+        '201':
+          description: 参加成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '404': { description: 招待コードが存在しない, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: 既に定員（2名）に達している / メール重複, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/auth/login:
+    post:
+      summary: ログイン
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200': { description: ログイン成功, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '401': { description: 認証失敗, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/auth/logout:
+    post:
+      summary: ログアウト
+      responses:
+        '204': { description: 成功 }
+
+  /api/auth/me:
+    get:
+      summary: 現在のセッション情報を取得
+      responses:
+        '200': { description: ログイン中, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '401': { description: 未ログイン, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/household/invite-code:
+    get:
+      summary: 自分の世帯の招待コードを取得
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inviteCode: { type: string }
+                  partnerJoined: { type: boolean }
+
+  /api/profile:
+    get:
+      summary: 世帯プロフィール（二人の名前・色・収入）を取得
+      responses:
+        '200': { description: 成功（未設定ならnull）, content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } } }
+    put:
+      summary: プロフィールを丸ごと設定
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } }
+      responses:
+        '200': { description: 成功, content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } } }
+    patch:
+      summary: プロフィールを部分更新
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } }
+      responses:
+        '200': { description: 成功, content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } } }
+
+  /api/expenses:
+    get:
+      summary: 支出一覧
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/Scope' }
+        - name: owner
+          in: query
+          schema: { $ref: '#/components/schemas/PersonKey' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Expense' } }
+    post:
+      summary: 支出を追加
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ExpenseInput' } } }
+      responses:
+        '201': { description: 作成成功, content: { application/json: { schema: { $ref: '#/components/schemas/Expense' } } } }
+
+  /api/expenses/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      summary: 支出を部分更新（精算フラグなど）
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ExpenseInput' } } }
+      responses:
+        '200': { description: 成功, content: { application/json: { schema: { $ref: '#/components/schemas/Expense' } } } }
+        '404': { description: 見つからない, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+    delete:
+      summary: 支出を削除
+      responses:
+        '204': { description: 成功 }
+        '404': { description: 見つからない, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/recurring:
+    get:
+      summary: 固定費一覧
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/Scope' }
+        - name: owner
+          in: query
+          schema: { $ref: '#/components/schemas/PersonKey' }
+      responses:
+        '200': { description: 成功, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RecurringCost' } } } } }
+    post:
+      summary: 固定費を追加
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/RecurringCostInput' } } }
+      responses:
+        '201': { description: 作成成功, content: { application/json: { schema: { $ref: '#/components/schemas/RecurringCost' } } } }
+
+  /api/recurring/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      summary: 固定費を部分更新
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/RecurringCostInput' } } }
+      responses:
+        '200': { description: 成功, content: { application/json: { schema: { $ref: '#/components/schemas/RecurringCost' } } } }
+    delete:
+      summary: 固定費を削除
+      responses:
+        '204': { description: 成功 }
+
+  /api/merchant-map:
+    get:
+      summary: 学習済みの店名→カテゴリ対応表を取得
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { type: string } }
+    post:
+      summary: 店名→カテゴリの対応を学習（マージ）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pairs]
+              properties:
+                pairs: { type: object, additionalProperties: { type: string } }
+      responses:
+        '204': { description: 成功 }
+
+  /api/receipts:
+    post:
+      summary: レシート画像を保存（AI解析は含まない）
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        '201':
+          description: 成功
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+        '400': { description: 画像が不正, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/receipts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: 保存済みレシート画像を取得
+      responses:
+        '200':
+          description: 成功（画像バイナリ）
+          content:
+            image/*: { schema: { type: string, format: binary } }
+        '404': { description: 見つからない }
+
+  /api/receipts/scan:
+    post:
+      summary: |
+        レシート画像をAI（運営者のAnthropic APIキー）で解析し、商品明細を抽出する。
+        アプリ内でAPIを消費する唯一のエンドポイント。世帯ごとの月間上限と、
+        全体（運営者キー）の日次上限の二段階でクォータを判定する。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        '200':
+          description: 解析成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiptScanResult' }
+        '400':
+          description: 画像が不正（image_rejected / images_unavailable）
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+        '429':
+          description: クォータ超過（rate_limited）
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+        '503':
+          description: サーバー側にAPIキーが設定されていない（not_granted）
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }

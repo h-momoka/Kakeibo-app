@@ -176,6 +176,10 @@
       b.addEventListener("click", function(){ state.tab = b.getAttribute("data-tab"); state.settleConfirm=false; render(); });
     });
     document.getElementById("whoPill").addEventListener("click", function(){
+      // authMode: each person has their own login, so this pill opens the
+      // account panel (invite code / logout) instead of letting anyone
+      // switch which person they're acting as.
+      if(authMode){ openAccountPanel(); return; }
       state.who = null;
       try{ localStorage.removeItem("kakeibo_who"); }catch(e){}
       if(state.unsubPersonal) state.unsubPersonal();

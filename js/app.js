@@ -3,6 +3,10 @@
   var root = document.getElementById("app");
 
   function render(){
+    if(authMode && !sessionUser){
+      renderAuthGate();
+      return;
+    }
     if(!state.profile){
       renderSetup();
       return;
@@ -51,7 +55,12 @@
         try{ sampleImageLimits = (await sampleApi.limits()).images || null; }catch(e){ sampleImageLimits = null; }
       }
     }
-    localMode = !dbApi;
+    // Three modes: the Claude Artifact sandbox (dbApi truthy, unchanged from
+    // the original single-file app); ?demo=1, a local-only design-QA preview
+    // with no login; and — the default everywhere else — the real public
+    // app talking to the Node/PostgreSQL backend (authMode).
+    localMode = !dbApi && location.search.indexOf("demo=1")>-1;
+    authMode = !dbApi && !localMode;
 
     // debug-only stand-ins so the receipt-scan review screen can be designed/QA'd
     // without a live sample/assets grant — never active outside ?demo=1 local preview.
@@ -93,12 +102,62 @@
       try{ localStorage.setItem("kakeibo_who","personA"); }catch(e){}
     }
 
+    if(authMode){
+      assetsApi = makeBackendAssetsApi();
+      sampleApi = makeBackendSampleApi();
+      sampleImageLimits = { maxCount:1, maxInputBytes:10*1024*1024, mediaTypes:["image/jpeg","image/png","image/webp"] };
+      try{ sessionUser = await apiFetch("/api/auth/me"); }
+      catch(e){ sessionUser = null; }
+      if(!sessionUser){
+        render();
+        return { who:null, tab:state.tab, monthCursor:state.monthCursor };
+      }
+      return onSignedIn(initData);
+    }
+
+    return continueBootAfterAuth(initData);
+  }
+
+  // Called once after a successful login/signup/join, and once at boot when
+  // GET /api/auth/me finds an existing session cookie.
+  async function onSignedIn(initData){
+    state.who = sessionUser.personKey;
+    return continueBootAfterAuth(initData);
+  }
+
+  // Called by core.js's apiFetch() whenever the server says the session
+  // cookie is no longer valid (401 mid-session) — send the person back to
+  // the login screen instead of leaving them looking at a broken app.
+  function onSessionExpired(){
+    if(state.unsubPersonal) state.unsubPersonal();
+    if(state.unsubShared) state.unsubShared();
+    if(state.unsubRecurringPersonal) state.unsubRecurringPersonal();
+    if(state.unsubRecurringShared) state.unsubRecurringShared();
+    state.who = null;
+    state.profile = null;
+    authScreenState = { mode:"login", error:"ログインの有効期限が切れました。もう一度ログインしてください。", loading:false };
+    render();
+  }
+
+  async function continueBootAfterAuth(initData){
     state.profile = await Store.getProfile();
     applyPersonColors();
-    Store.watchProfile(function(p){ state.profile = p; applyPersonColors(); if(!sheetState && !importState && !recurringMgrState) render(); });
+    Store.watchProfile(function(p){
+      var hadProfile = !!state.profile;
+      state.profile = p;
+      applyPersonColors();
+      // In authMode, state.who is already known from the session (there is
+      // no shared-device whoami step), so the very first time the profile
+      // appears we must start the data subscriptions ourselves — nothing
+      // else in the original flow does it for us in that case.
+      if(authMode && state.who && p && !hadProfile){ subscribeAll(); }
+      if(!sheetState && !importState && !recurringMgrState) render();
+    });
     Store.watchMerchantMap(function(m){ state.merchantMap = m || {}; });
 
-    try{ state.who = localStorage.getItem("kakeibo_who"); }catch(e){ state.who = null; }
+    if(!authMode){
+      try{ state.who = localStorage.getItem("kakeibo_who"); }catch(e){ state.who = null; }
+    }
     if(state.who && state.profile){ subscribeAll(); }
 
     render();
