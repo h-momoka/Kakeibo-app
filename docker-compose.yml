@@ -46,5 +46,17 @@ services:
     # 初回起動時にテーブルも作成してからサーバーを起動する
     command: sh -c "cd /app/server && npx prisma migrate deploy && node src/index.js"
 
+  # 勉強用に追加。appの手前に置く「受付」。
+  # http://localhost:8080 にアクセスすると、Nginxが受け取ってappに転送する。
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
 volumes:
   kakeibo_pg_data:
