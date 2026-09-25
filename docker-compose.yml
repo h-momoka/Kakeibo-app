@@ -1,0 +1,50 @@
+# ローカルでDockerを使って一式（サーバー＋PostgreSQL）を試すための設定。
+# 使い方: `docker compose up --build`
+#
+# ポイント: アプリのコンテナからDBに繋ぐ時、.envに書いた「localhost」は
+# コンテナ自身を指してしまい、ホストPC上のPostgreSQLには繋がらない。
+# ここではPostgreSQLも一緒にコンテナとして起動し、サービス名「db」で
+# 繋ぐことで、そのわずらわしさを避けている。
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kakeibo
+      POSTGRES_PASSWORD: kakeibo_dev
+      POSTGRES_DB: kakeibo
+    # ホスト側の5432番ポートには公開しない。PCですでにPostgreSQLが
+    # 5432番で動いているため、公開しようとすると衝突して起動に失敗する。
+    # アプリのコンテナからは "db" という名前でそのままアクセスできるので
+    # ホストへの公開は不要。
+    volumes:
+      - kakeibo_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kakeibo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      # サービス名「db」が、compose内のPostgreSQLコンテナのホスト名になる
+      DATABASE_URL: postgresql://kakeibo:kakeibo_dev@db:5432/kakeibo
+      SESSION_SECRET: ${SESSION_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}
+      RECEIPT_SCAN_HOUSEHOLD_MONTHLY_LIMIT: ${RECEIPT_SCAN_HOUSEHOLD_MONTHLY_LIMIT:-100}
+      RECEIPT_SCAN_GLOBAL_DAILY_LIMIT: ${RECEIPT_SCAN_GLOBAL_DAILY_LIMIT:-200}
+      NODE_ENV: production
+      PORT: 3000
+    # 初回起動時にテーブルも作成してからサーバーを起動する
+    command: sh -c "cd /app/server && npx prisma migrate deploy && node src/index.js"
+
+volumes:
+  kakeibo_pg_data:

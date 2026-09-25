@@ -4,7 +4,18 @@ require("dotenv").config();
 
 const path = require("path");
 const express = require("express");
+// Patches Express so a rejected promise inside an async route handler (e.g.
+// a Prisma call failing because the database is unreachable) is passed to
+// the error-handling middleware below, instead of becoming an unhandled
+// rejection that crashes the whole process on a single bad request.
+require("express-async-errors");
 const { createSessionMiddleware } = require("./lib/session");
+
+// Last-resort safety net: log and keep serving other requests rather than
+// let one unexpected rejection anywhere take the whole server down.
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandledRejection]", err);
+});
 
 const authRoutes = require("./routes/auth");
 const householdRoutes = require("./routes/household");
