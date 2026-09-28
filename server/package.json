@@ -6,7 +6,7 @@
   "type": "commonjs",
   "main": "src/index.js",
   "scripts": {
-    "dev": "node src/index.js",
+    "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
@@ -29,6 +29,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "nodemon": "^3.1.7",
     "prisma": "^5.20.0"
   }
 }

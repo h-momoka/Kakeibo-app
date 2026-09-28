@@ -33,6 +33,9 @@ services:
         condition: service_healthy
     ports:
       - "3000:3000"
+    volumes:
+      - .:/app                      # PC本体のkakeiboフォルダをコンテナの/appに同期
+      - /app/server/node_modules    # server/node_modulesだけはコンテナ内のものを維持(PCとOSが違う場合の対策)
     environment:
       # サービス名「db」が、compose内のPostgreSQLコンテナのホスト名になる
       DATABASE_URL: postgresql://kakeibo:kakeibo_dev@db:5432/kakeibo
@@ -44,7 +47,8 @@ services:
       NODE_ENV: production
       PORT: 3000
     # 初回起動時にテーブルも作成してからサーバーを起動する
-    command: sh -c "cd /app/server && npx prisma migrate deploy && node src/index.js"
+    # node ではなく nodemon で起動し、コード保存時に自動でサーバーを再起動させる
+    command: sh -c "cd /app/server && npx prisma migrate deploy && npx nodemon src/index.js"
 
   # 勉強用に追加。appの手前に置く「受付」。
   # http://localhost:8080 にアクセスすると、Nginxが受け取ってappに転送する。
